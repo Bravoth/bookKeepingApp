@@ -36,7 +36,6 @@ import software.amazon.awssdk.services.dynamodb.model.ScalarAttributeType;
 public class BookKeeping {
 
     static final Region REGION = Region.US_EAST_1;
-    static final String CSV_PATH = "data/Aug_2026.csv";
 
     // CSV column indexes
     static final int COL_ID         = 1;
@@ -63,6 +62,14 @@ public class BookKeeping {
 
     public static void main(String[] args) {
 
+        if (args.length < 1) {
+            System.err.println("Usage: BookKeeping <path-to-csv>");
+            System.err.println("Example: BookKeeping data/Aug_2026.csv");
+            return;
+        }
+
+        String csvPath = args[0];
+
         DynamoDbClient dynamo = DynamoDbClient.builder()
                 .region(REGION)
                 .build();
@@ -71,7 +78,7 @@ public class BookKeeping {
                 .region(REGION)
                 .build();
 
-        try (CSVReader reader = new CSVReader(new FileReader(new File(CSV_PATH)))) {
+        try (CSVReader reader = new CSVReader(new FileReader(new File(csvPath)))) {
 
             // Skip: account info row, "Account Activity" row, column headers row, opening balance row
             reader.skip(4);
@@ -225,8 +232,8 @@ public class BookKeeping {
     /**
      * Convenience method for AuditBooks — reads the CSV and derives the table name.
      */
-    static String deriveTableNameFromCsv() {
-        try (CSVReader reader = new CSVReader(new FileReader(new File(CSV_PATH)))) {
+    static String deriveTableNameFromCsv(String csvPath) {
+        try (CSVReader reader = new CSVReader(new FileReader(new File(csvPath)))) {
             reader.skip(4);
             List<String[]> rows = reader.readAll();
             return deriveTableName(rows);

@@ -1,13 +1,13 @@
 package com.app.bookkeeping;
 
+import java.util.Map;
+import java.util.TreeMap;
+
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
 import software.amazon.awssdk.services.dynamodb.model.ScanRequest;
 import software.amazon.awssdk.services.dynamodb.model.ScanResponse;
-
-import java.util.Map;
-import java.util.TreeMap;
 
 /**
  * AuditBooks — scans a Bookkeeping DynamoDB table and prints total spending per category.
@@ -26,8 +26,15 @@ public class AuditBooks {
             // Accept "2026_08" style as a single arg too
             tableName = "Bookkeeping_" + args[0];
         } else {
-            // Default: derive from current CSV the same way BookKeeping does
-            tableName = BookKeeping.deriveTableNameFromCsv();
+            // Default: derive from CSV passed as third arg, or prompt user
+            if (args.length >= 1) {
+                tableName = BookKeeping.deriveTableNameFromCsv(args[0]);
+            } else {
+                System.err.println("Usage: AuditBooks <csv-path>  OR  AuditBooks <year> <month>");
+                System.err.println("Example: AuditBooks data/Aug_2026.csv");
+                System.err.println("Example: AuditBooks 2026 08");
+                return;
+            }
         }
 
         System.out.println("Auditing table: " + tableName);

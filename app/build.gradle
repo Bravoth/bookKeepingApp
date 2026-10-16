@@ -32,7 +32,6 @@ dependencies {
 
     // CSV reading
     implementation libs.opencsv
-    implementation libs.opencsv
 }
 
 // Apply a specific Java toolchain to ease working on different environments.
@@ -50,4 +49,13 @@ application {
 tasks.named('test') {
     // Use JUnit Platform for unit tests.
     useJUnitPlatform()
+}
+
+// Run the AuditBooks class: .\gradlew.bat audit --args="2026 09"
+tasks.register('audit', JavaExec) {
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.app.bookkeeping.AuditBooks'
+    if (project.hasProperty('args')) {
+        args project.property('args').split(' ')
+    }
 }
