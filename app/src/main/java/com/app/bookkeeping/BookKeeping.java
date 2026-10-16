@@ -4,8 +4,11 @@ import java.io.File;
 import java.io.FileReader;
 import java.io.IOException;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import com.opencsv.CSVReader;
 import com.opencsv.exceptions.CsvException;
@@ -28,10 +31,11 @@ import software.amazon.awssdk.services.dynamodb.model.ResourceNotFoundException;
 import software.amazon.awssdk.services.dynamodb.model.ScalarAttributeType;
 
 /**
- * BookKeeping — reads a Venmo CSV export, categorizes each transaction using
- * Amazon Nova Micro via Bedrock, and loads everything into DynamoDB.
- * The table name is derived from the year and month in the first row's Datetime column,
- * e.g. "Bookkeeping_2026_08".
+ * BookKeeping — reads a Venmo CSV export, categorizes transactions using
+ * a single Amazon Nova Micro call for all unique merchants, then loads
+ * everything into DynamoDB.
+ *
+ * The table name is derived from the Datetime column: 2026-08-01T... -> Bookkeeping_2026_08
  */
 public class BookKeeping {
 
@@ -70,49 +74,52 @@ public class BookKeeping {
 
         String csvPath = args[0];
 
-        DynamoDbClient dynamo = DynamoDbClient.builder()
-                .region(REGION)
-                .build();
-
-        BedrockRuntimeClient bedrock = BedrockRuntimeClient.builder()
-                .region(REGION)
-                .build();
+        DynamoDbClient dynamo = DynamoDbClient.builder().region(REGION).build();
+        BedrockRuntimeClient bedrock = BedrockRuntimeClient.builder().region(REGION).build();
 
         try (CSVReader reader = new CSVReader(new FileReader(new File(csvPath)))) {
 
-            // Skip: account info row, "Account Activity" row, column headers row, opening balance row
+            // Skip: account info, "Account Activity", column headers, opening balance
             reader.skip(4);
-
             List<String[]> rows = reader.readAll();
 
-            // Derive table name from the datetime of the first valid row
-            // Datetime format: 2026-08-01T00:37:19 -> "Bookkeeping_2026_08"
             String tableName = deriveTableName(rows);
             System.out.println("Using table: " + tableName);
-
             createTableIfNotExists(dynamo, tableName);
 
+            // Step 1: collect unique "To" values across all valid rows
+            Set<String> uniqueMerchants = new LinkedHashSet<>();
+            for (String[] row : rows) {
+                if (row.length <= COL_ID || row[COL_ID].isBlank()) continue;
+                String to = safeGet(row, COL_TO);
+                if (!to.isBlank() && !to.equals("-")) uniqueMerchants.add(to);
+            }
+            System.out.println("Found " + uniqueMerchants.size() + " unique merchants — sending one Bedrock request...");
+
+            // Step 2: one Bedrock call to categorize all unique merchants
+            Map<String, String> categoryMap = categorizeMerchants(bedrock, uniqueMerchants);
+            System.out.println("Categorization complete. Loading into DynamoDB...");
+
+            // Step 3: write each row to DynamoDB using the category map
             for (String[] row : rows) {
                 if (row.length <= COL_ID || row[COL_ID].isBlank()) continue;
 
-                String id     = row[COL_ID].trim();
-                String to     = safeGet(row, COL_TO);
-                String from   = safeGet(row, COL_FROM);
-                String note   = safeGet(row, COL_NOTE);
-                String amount = safeGet(row, COL_AMOUNT);
-                String type   = safeGet(row, COL_TYPE);
+                String id   = row[COL_ID].trim();
+                String to   = safeGet(row, COL_TO);
+                String type = safeGet(row, COL_TYPE);
 
-                String category = categorize(bedrock, to, from, note, amount, type);
+                // Look up category from map, fall back to "Other" if not found
+                String category = categoryMap.getOrDefault(to, "Other");
 
                 Map<String, AttributeValue> item = new HashMap<>();
                 item.put("ID",            attr(id));
                 item.put("Datetime",      attr(safeGet(row, COL_DATETIME)));
                 item.put("Type",          attr(type));
                 item.put("Status",        attr(safeGet(row, COL_STATUS)));
-                item.put("Note",          attr(note));
-                item.put("From",          attr(from));
+                item.put("Note",          attr(safeGet(row, COL_NOTE)));
+                item.put("From",          attr(safeGet(row, COL_FROM)));
                 item.put("To",            attr(to));
-                item.put("Amount",        attr(amount));
+                item.put("Amount",        attr(safeGet(row, COL_AMOUNT)));
                 item.put("Tip",           attr(safeGet(row, COL_TIP)));
                 item.put("Tax",           attr(safeGet(row, COL_TAX)));
                 item.put("Fee",           attr(safeGet(row, COL_FEE)));
@@ -132,7 +139,7 @@ public class BookKeeping {
                         .item(item)
                         .build());
 
-                System.out.println("Inserted ID=" + id + " | Category=" + category);
+                System.out.println("Inserted ID=" + id + " | To=" + to + " | Category=" + category);
             }
 
         } catch (IOException | CsvException e) {
@@ -145,27 +152,97 @@ public class BookKeeping {
     }
 
     /**
-     * Finds the first row with a valid Datetime value and extracts year and month.
-     * Datetime format: 2026-08-01T00:37:19 -> "Bookkeeping_2026_08"
+     * Sends all unique merchant names to Nova Micro in a single prompt.
+     * Returns a map of merchant -> category.
+     * Prompt format asks for one "Merchant: Category" line per entry.
+     */
+    static Map<String, String> categorizeMerchants(BedrockRuntimeClient bedrock, Set<String> merchants) {
+        Map<String, String> result = new LinkedHashMap<>();
+        if (merchants.isEmpty()) return result;
+
+        // Build a numbered list of merchants for the prompt
+        StringBuilder merchantList = new StringBuilder();
+        for (String merchant : merchants) {
+            merchantList.append("- ").append(merchant).append("\\n");
+        }
+
+        String prompt =
+            "You are categorizing financial transactions. For each merchant below, " +
+            "reply with a single line in the format: Merchant: Category\\n" +
+            "Use short category names like Food, Groceries, Rent, Transport, Entertainment, " +
+            "Fitness, Utilities, Subscription, Shopping, or whatever fits best.\\n\\n" +
+            "Merchants:\\n" + merchantList +
+            "\\nReply with only the merchant-category lines, nothing else.";
+
+        String body = String.format(
+            "{\"messages\":[{\"role\":\"user\",\"content\":[{\"text\":\"%s\"}]}]}",
+            prompt.replace("\"", "\\\"")
+        );
+
+        try {
+            InvokeModelResponse response = bedrock.invokeModel(InvokeModelRequest.builder()
+                    .modelId("amazon.nova-micro-v1:0")
+                    .contentType("application/json")
+                    .accept("application/json")
+                    .body(SdkBytes.fromUtf8String(body))
+                    .build());
+
+            String responseJson = response.body().asUtf8String();
+            // Extract the text block from Nova's response
+            int textIndex = responseJson.indexOf("\"text\":\"") + 8;
+            int textEnd   = responseJson.lastIndexOf("\"");
+            String text   = responseJson.substring(textIndex, textEnd)
+                    .replace("\\n", "\n")
+                    .replace("\\\"", "\"");
+
+            // Parse each "Merchant: Category" line
+            for (String line : text.split("\n")) {
+                int colonIdx = line.indexOf(":");
+                if (colonIdx < 0) continue;
+                String merchant  = line.substring(0, colonIdx).trim().replaceFirst("^- ", "");
+                String category  = line.substring(colonIdx + 1).trim();
+                if (!merchant.isBlank() && !category.isBlank()) {
+                    result.put(merchant, category);
+                }
+            }
+
+        } catch (Exception e) {
+            System.err.println("Bedrock error: " + e.getMessage());
+            // Fall back: assign "Other" to all merchants
+            for (String merchant : merchants) result.put(merchant, "Other");
+        }
+
+        return result;
+    }
+
+    /**
+     * Derives table name from the first valid Datetime value in the rows.
+     * 2026-08-01T00:37:19 -> "Bookkeeping_2026_08"
      */
     static String deriveTableName(List<String[]> rows) {
         for (String[] row : rows) {
             if (row.length <= COL_DATETIME) continue;
             String datetime = row[COL_DATETIME].trim();
-            // Datetime starts with YYYY-MM-
             if (datetime.matches("\\d{4}-\\d{2}-.*")) {
-                String year  = datetime.substring(0, 4);
-                String month = datetime.substring(5, 7);
-                return "Bookkeeping_" + year + "_" + month;
+                return "Bookkeeping_" + datetime.substring(0, 4) + "_" + datetime.substring(5, 7);
             }
         }
-        // Fallback if no valid datetime found
         return "Bookkeeping_Unknown";
     }
 
     /**
-     * Creates the DynamoDB table with ID as the partition key if it doesn't already exist.
+     * Convenience method for AuditBooks to derive table name from a CSV file.
      */
+    static String deriveTableNameFromCsv(String csvPath) {
+        try (CSVReader reader = new CSVReader(new FileReader(new File(csvPath)))) {
+            reader.skip(4);
+            return deriveTableName(reader.readAll());
+        } catch (IOException | CsvException e) {
+            System.err.println("Could not read CSV to derive table name: " + e.getMessage());
+            return "Bookkeeping_Unknown";
+        }
+    }
+
     static void createTableIfNotExists(DynamoDbClient dynamo, String tableName) {
         try {
             dynamo.describeTable(DescribeTableRequest.builder().tableName(tableName).build());
@@ -184,62 +261,9 @@ public class BookKeeping {
                             .build())
                     .billingMode(BillingMode.PAY_PER_REQUEST)
                     .build());
-
             dynamo.waiter().waitUntilTableExists(
                     DescribeTableRequest.builder().tableName(tableName).build());
             System.out.println("Table created and active.");
-        }
-    }
-
-    /**
-     * Uses Amazon Nova Micro on Bedrock to categorize a transaction.
-     */
-    static String categorize(BedrockRuntimeClient bedrock, String to, String from, String note, String amount, String type) {
-        String prompt = String.format(
-            "Categorize this financial transaction into a single short category name " +
-            "(e.g. Food, Rent, Transport, Entertainment — use your best judgment).\\n\\n" +
-            "Transaction details:\\n" +
-            "- To: %s\\n- From: %s\\n- Note: %s\\n- Amount: %s\\n- Type: %s\\n\\n" +
-            "Reply with only the category name, nothing else.",
-            to, from, note, amount, type
-        );
-
-        String body = String.format(
-            "{\"messages\":[{\"role\":\"user\",\"content\":[{\"text\":\"%s\"}]}]}",
-            prompt.replace("\"", "\\\"")
-        );
-
-        try {
-            InvokeModelResponse response = bedrock.invokeModel(InvokeModelRequest.builder()
-                    .modelId("amazon.nova-micro-v1:0")
-                    .contentType("application/json")
-                    .accept("application/json")
-                    .body(SdkBytes.fromUtf8String(body))
-                    .build());
-
-            String responseJson = response.body().asUtf8String();
-            // Nova Micro response: {"output":{"message":{"content":[{"text":"Food"}]}},...}
-            int textIndex = responseJson.indexOf("\"text\":\"") + 8;
-            int textEnd   = responseJson.indexOf("\"", textIndex);
-            return responseJson.substring(textIndex, textEnd).trim();
-
-        } catch (Exception e) {
-            System.err.println("Bedrock error for to=" + to + ": " + e.getMessage());
-            return "Other";
-        }
-    }
-
-    /**
-     * Convenience method for AuditBooks — reads the CSV and derives the table name.
-     */
-    static String deriveTableNameFromCsv(String csvPath) {
-        try (CSVReader reader = new CSVReader(new FileReader(new File(csvPath)))) {
-            reader.skip(4);
-            List<String[]> rows = reader.readAll();
-            return deriveTableName(rows);
-        } catch (IOException | CsvException e) {
-            System.err.println("Could not read CSV to derive table name: " + e.getMessage());
-            return "Bookkeeping_Unknown";
         }
     }
 
